@@ -1,0 +1,89 @@
+{
+    "id": "b13c5ca2-0761-4c9c-b1bc-efe3c2f66769",
+    "name": "dorcrequest",
+    "friendlyName": "Dorc request",
+    "description": "Create new DOrc request in your pipeline",
+    "helpMarkDown": "",
+    "category": "Utility",
+    "author": "Ben Hegarty",
+    "version": {
+        "Major": 3,
+        "Minor": 2,
+        "Patch": 0
+    },
+    "instanceNameFormat": "Echo $(samplestring)",
+    "inputs": [
+        {
+            "name":"baseurl",
+            "type":"string",
+            "label":"Api base URL",
+            "helpMarkDown":"Api base URL i.e. https://deploymentportal:8443/",
+            "required":true
+        },
+        {
+            "name": "dorcIDSsecret",
+            "type": "string",
+            "label": "Dorc IDS Secret",
+            "required": true,
+            "helpMarkDown": "Identiy Server Client secret for DORC API"
+        },    
+        {
+            "name": "project",
+            "type": "string",
+            "label": "Project name",
+            "required": true,
+            "helpMarkDown": "Project name like in Dorc"
+        },
+
+        {
+            "name":"targetenv",
+            "type":"string",
+            "label":"Environment name",
+            "required":true,
+            "helpMarkDown":"Environment name like in Doec"
+        },
+        {
+            "name":"buildtext",
+            "type":"string",
+            "label": "Name of the TFS build",
+            "helpMarkDown": "Name of the TFS build"
+        },
+        {
+            "name":"buildnum",
+            "type": "string",
+            "label": "Version of the build",
+            "helpMarkDown":"version of the build or \"latest\""
+        },
+        {
+            "name":"components",
+            "type":"string",
+            "label":"Components",
+            "required":true,
+            "helpMarkDown": "List of DOrc components semicolon(;) delimited"
+        },
+        {
+            "name":"pinned",
+            "type":"boolean",
+            "label" : "Pinned",
+            "helpMarkDown":"Use only pinned build"
+        },
+        {
+            "name":"builduri",
+            "type":"string",
+            "label":"Build Uri",
+            "helpMarkDown":"Point request to dropfolder instead of TFS link (required for NON TFS build)"
+        },
+        {
+            "name":"vstfsUrl",
+            "type":"string",
+            "label":"vstfs:// Build Uri",
+            "helpMarkDown":"Point request to the build directly. Will ignore buildtext and buildnum if specified"
+        }
+        
+    ],
+    "execution": {
+        "PowerShell3": {
+            "target": "index.ps1"
+        }
+    }
+}
