@@ -41,7 +41,11 @@ try {
         )
 
         $tokenResult = Invoke-WebRequest -Uri $TokenUrl -Method POST -Headers $Headers -Body $FormData -UseBasicParsing
-        return $tokenResult.Content | ConvertFrom-Json
+        $parsed = $tokenResult.Content | ConvertFrom-Json
+        if (-not $parsed.access_token) {
+            throw "Token response did not contain an access_token. Response: $($tokenResult.Content)"
+        }
+        return $parsed
     }
 
     function Refresh-DorcAccessToken {
@@ -109,11 +113,22 @@ try {
     $IDSFormData = @{
         "grant_type" = "client_credentials"
         "client_id" = "dorc-cli"
-        "client_secret" = "$DorcIDSsecret"
+        "client_secret" = $DorcIDSsecret
         "scope" = "dorc-api.manage"
     }
-    $IDSBaseURL = Invoke-WebRequest -Uri "$baseurl/ApiConfig" -UseBasicParsing | ConvertFrom-Json
-    $IDSBaseURL = $IDSBaseURL.OAuthAuthority +"/connect/token"
+    try {
+        $apiConfigResponse = Invoke-WebRequest -Uri "$baseurl/ApiConfig" -UseBasicParsing
+        $apiConfig = ConvertFrom-Json -InputObject $apiConfigResponse.Content
+    }
+    catch {
+        Write-VstsSetResult -Result "Failed" -Message "Failed to fetch or parse DOrc API config from '$baseurl/ApiConfig': $($_.Exception.Message)"
+        return
+    }
+    if (-not $apiConfig.OAuthAuthority) {
+        Write-VstsSetResult -Result "Failed" -Message "DOrc API config did not return an OAuthAuthority value."
+        return
+    }
+    $IDSBaseURL = $apiConfig.OAuthAuthority.TrimEnd('/') + "/connect/token"
     Write-Host "IDSBaseURL is:" $IDSBaseURL
     $tokenState = @{}
     Ensure-DorcAccessToken -TokenState $tokenState -TokenUrl $IDSBaseURL -Headers $IDSHeaders -FormData $IDSFormData
@@ -125,16 +140,16 @@ try {
     $requestUrl = $baseurl+"/Request"
     
     $request = [ordered]@{
-        Project= "$project"
-        Environment = "$targetenv"
-        BuildUrl = "$builduri"
-        BuildText = "$buildtext"
-        BuildNum = "$buildnum"
+        Project = $project
+        Environment = $targetenv
         Pinned = $pinned
-        VstsUrl = "$vstfsUrl"
-        Components = @($components.Split(";"))
+        Components = @($components.Split(";") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
     }
-    $jsonRequest = ConvertTo-Json $request
+    if ($builduri) { $request["BuildUrl"] = $builduri }
+    if ($buildtext) { $request["BuildText"] = $buildtext }
+    if ($buildnum) { $request["BuildNum"] = $buildnum }
+    if ($vstfsUrl) { $request["VstsUrl"] = $vstfsUrl }
+    $jsonRequest = ConvertTo-Json $request -Depth 5
     Write-Host $jsonRequest
     try {
         $result = Invoke-RestMethod -Method POST -Uri $requestUrl -Body $jsonRequest -ContentType "application/json" -Headers $DorcAPIHeaders
@@ -160,67 +175,201 @@ try {
         }
     }
     
-    if ($result.Id -gt 0){
-        Write-Host "Request " $result.Id " was created"
+    if ($null -ne $result -and $null -ne $result.Id -and $result.Id -ne 0){
+        Write-Host "Request $($result.Id) was created"
         $itemUrl=$requestUrl+"?id="+$result.Id
         $oldStatus = ""
-        while (-not $validStatuses.Contains($oldStatus)){
+        $r = $null
+        $componentStatuses = @{}
+        $pollStartTime = Get-Date
+        $pollDeadline = $pollStartTime.AddMinutes(240)
+        while ((-not ($validStatuses -contains $oldStatus)) -and ((Get-Date) -lt $pollDeadline)){
             Start-Sleep -Seconds 5
 
             Ensure-DorcAccessToken -TokenState $tokenState -TokenUrl $IDSBaseURL -Headers $IDSHeaders -FormData $IDSFormData
             $DorcAPIHeaders["Authorization"] = "Bearer $($tokenState.AccessToken)"
 
             try {
-                $r=Invoke-RestMethod -Method GET -Uri $itemUrl -Headers $DorcAPIHeaders
+                $r = Invoke-RestMethod -Method GET -Uri $itemUrl -Headers $DorcAPIHeaders
             }
             catch {
                 $statusCode = Get-StatusCodeFromException -Exception $_
                 if ($statusCode -eq 401) {
-                    Write-Host "Received 401 from DOrc API. Refreshing token and retrying once."
+                    try {
+                        Write-Host "Received 401 from DOrc API. Refreshing token and retrying once."
+                        $newToken = Refresh-DorcAccessToken -TokenUrl $IDSBaseURL -Headers $IDSHeaders -FormData $IDSFormData
+                        $tokenState.AccessToken = $newToken.AccessToken
+                        $tokenState.ExpiresAt = $newToken.ExpiresAt
+                        $DorcAPIHeaders["Authorization"] = "Bearer $($tokenState.AccessToken)"
+                        $r = Invoke-RestMethod -Method GET -Uri $itemUrl -Headers $DorcAPIHeaders
+                    }
+                    catch {
+                        Write-Host "Warning: Failed to fetch request status after token refresh: $($_.Exception.Message)"
+                        continue
+                    }
+                }
+                else {
+                    Write-Host "Warning: Failed to fetch request status: $($_.Exception.Message)"
+                    continue
+                }
+            }
+
+            if ($null -ne $r -and $oldStatus -ne $r.Status) {
+                Write-Host "Request $($result.Id) status: $($r.Status)"
+                $oldStatus = $r.Status
+            }
+
+            # Live component progress
+            $componentStatusUri = $baseurl + "/ResultStatuses?requestId=$($result.Id)"
+            try {
+                $componentResponse = Invoke-WebRequest -Uri $componentStatusUri -Method GET -Headers $DorcAPIHeaders -UseBasicParsing
+                $currentComponents = @(ConvertFrom-Json -InputObject $componentResponse.Content)
+            }
+            catch {
+                $statusCode = Get-StatusCodeFromException -Exception $_
+                if ($statusCode -eq 401) {
+                    try {
+                        $newToken = Refresh-DorcAccessToken -TokenUrl $IDSBaseURL -Headers $IDSHeaders -FormData $IDSFormData
+                        $tokenState.AccessToken = $newToken.AccessToken
+                        $tokenState.ExpiresAt = $newToken.ExpiresAt
+                        $DorcAPIHeaders["Authorization"] = "Bearer $($tokenState.AccessToken)"
+                        $componentResponse = Invoke-WebRequest -Uri $componentStatusUri -Method GET -Headers $DorcAPIHeaders -UseBasicParsing
+                        $currentComponents = @(ConvertFrom-Json -InputObject $componentResponse.Content)
+                    }
+                    catch {
+                        Write-Host "Warning: Failed to fetch component statuses after token refresh: $($_.Exception.Message)"
+                        $currentComponents = @()
+                    }
+                }
+                else {
+                    Write-Host "Warning: Failed to fetch component statuses: $($_.Exception.Message)"
+                    $currentComponents = @()
+                }
+            }
+            foreach ($cmp in $currentComponents) {
+                if (-not $cmp -or -not $cmp.ComponentName) { continue }
+                $prevStatus = $null
+                if ($componentStatuses.ContainsKey($cmp.ComponentName)) {
+                    $prevStatus = $componentStatuses[$cmp.ComponentName]
+                }
+                if ($prevStatus -ne $cmp.Status) {
+                    Write-Host "  Component '$($cmp.ComponentName)': $($cmp.Status)"
+                    $componentStatuses[$cmp.ComponentName] = $cmp.Status
+                }
+            }
+        }
+        if (-not ($validStatuses -contains $oldStatus)) {
+            $lastStatus = if ($oldStatus) { $oldStatus } else { "(no status received)" }
+            Write-VstsSetResult -Result "Failed" -Message "Polling timed out. Last status: $lastStatus"
+            return
+        }
+
+        Write-Host "Collecting deploy results"
+        $id = $result.Id
+        $uri = $baseurl + "/ResultStatuses?requestId=$id"
+
+        Ensure-DorcAccessToken -TokenState $tokenState -TokenUrl $IDSBaseURL -Headers $IDSHeaders -FormData $IDSFormData
+        $DorcAPIHeaders["Authorization"] = "Bearer $($tokenState.AccessToken)"
+
+        try {
+            $r = Invoke-WebRequest -Uri $uri -Method GET -Headers $DorcAPIHeaders -UseBasicParsing
+        }
+        catch {
+            $statusCode = Get-StatusCodeFromException -Exception $_
+            if ($statusCode -eq 401) {
+                try {
                     $newToken = Refresh-DorcAccessToken -TokenUrl $IDSBaseURL -Headers $IDSHeaders -FormData $IDSFormData
                     $tokenState.AccessToken = $newToken.AccessToken
                     $tokenState.ExpiresAt = $newToken.ExpiresAt
                     $DorcAPIHeaders["Authorization"] = "Bearer $($tokenState.AccessToken)"
-                    $r=Invoke-RestMethod -Method GET -Uri $itemUrl -Headers $DorcAPIHeaders
+                    $r = Invoke-WebRequest -Uri $uri -Method GET -Headers $DorcAPIHeaders -UseBasicParsing
                 }
-                else {
-                    throw
+                catch {
+                    Write-VstsSetResult -Result "Failed" -Message "Failed to fetch deployment results after token refresh: $($_.Exception.Message)"
+                    return
                 }
+            }
+            else {
+                Write-VstsSetResult -Result "Failed" -Message "Failed to fetch deployment results: $($_.Exception.Message)"
+                return
+            }
+        }
+
+        try {
+            $cmps = @(ConvertFrom-Json -InputObject $r.Content)
+        }
+        catch {
+            Write-Host "Warning: Failed to parse deployment results: $($_.Exception.Message)"
+            $cmps = @()
+        }
+
+        foreach ($cmp in $cmps) {
+            if (-not $cmp -or -not $cmp.ComponentName) { continue }
+            $fullLog = $null
+            Write-Host "<|=======================================================================|>"
+            Write-Host ("<|  {0}  {1}  |>" -f $cmp.ComponentName, $cmp.Status)
+            Write-Host "<|=======================================================================|>"
+
+            # Fetch full log for this component
+            if ($null -ne $cmp.Id) {
+                $logUri = $baseurl + "/ResultStatuses/Log?requestId=$id&resultId=$($cmp.Id)"
+                try {
+                    try {
+                        Ensure-DorcAccessToken -TokenState $tokenState -TokenUrl $IDSBaseURL -Headers $IDSHeaders -FormData $IDSFormData
+                        $DorcAPIHeaders["Authorization"] = "Bearer $($tokenState.AccessToken)"
+                    }
+                    catch {
+                        Write-Host "Warning: Token refresh failed before fetching log for '$($cmp.ComponentName)': $($_.Exception.Message)"
+                    }
+
+                    $logResponse = Invoke-WebRequest -Uri $logUri -Method GET -Headers $DorcAPIHeaders -UseBasicParsing
+                    $fullLog = $logResponse.Content
+                }
+                catch {
+                    $statusCode = Get-StatusCodeFromException -Exception $_
+                    if ($statusCode -eq 401) {
+                        try {
+                            $newToken = Refresh-DorcAccessToken -TokenUrl $IDSBaseURL -Headers $IDSHeaders -FormData $IDSFormData
+                            $tokenState.AccessToken = $newToken.AccessToken
+                            $tokenState.ExpiresAt = $newToken.ExpiresAt
+                            $DorcAPIHeaders["Authorization"] = "Bearer $($tokenState.AccessToken)"
+                            $logResponse = Invoke-WebRequest -Uri $logUri -Method GET -Headers $DorcAPIHeaders -UseBasicParsing
+                            $fullLog = $logResponse.Content
+                        }
+                        catch {
+                            Write-Host "Warning: Failed to fetch full log for component '$($cmp.ComponentName)' after token refresh: $($_.Exception.Message)"
+                            $fullLog = $cmp.Log
+                        }
+                    }
+                    elseif ($statusCode -eq 404) {
+                        Write-Host "No full log available for component '$($cmp.ComponentName)'. Showing preview:"
+                        $fullLog = $cmp.Log
+                    }
+                    else {
+                        Write-Host "Warning: Failed to fetch full log for component '$($cmp.ComponentName)': $($_.Exception.Message)"
+                        $fullLog = $cmp.Log
+                    }
+                }
+            }
+            else {
+                $fullLog = $cmp.Log
             }
 
-            if ($oldStatus -ne $r.Status) {
-                Write-Host "Request " $result.Id " is changed status to " $r.Status
-                $oldStatus=$r.Status
-            }            
+            if ($fullLog) {
+                Write-Host $fullLog
+            }
         }
-        Write-Host "Collecting deploy results"
-        if (-not $goodStatuses.Contains($oldStatus)){
-            $message= "Execution finished with status: "+$oldStatus
-            $id=$result.Id
-            $uri=$baseurl + "/ResultStatuses?requestId=$id"
-            $r = Invoke-WebRequest -Uri $uri -Method GET -Headers $DorcAPIHeaders -UseBasicParsing
-            $cmps = ConvertFrom-Json -InputObject $r.Content
-            foreach ($cmp in $cmps) {
-                Write-Host "<|=======================================================================|>"
-                Write-Host "<|               "$cmp.ComponentName $cmp.Status
-                Write-Host "<|=======================================================================|>"
-                Write-Host $cmp.Log
-            }
-            Write-VstsSetResult -Result "Failed" -Message $message
-        }else {
-            $message= "Execution finished with status: "+$oldStatus
-            $id=$result.Id
-            $uri=$baseurl + "/ResultStatuses?requestId=$id"
-            $r = Invoke-WebRequest -Uri $uri -Method GET -Headers $DorcAPIHeaders -UseBasicParsing
-            $cmps = ConvertFrom-Json -InputObject $r.Content
-            foreach ($cmp in $cmps) {
-                Write-Host "<|=======================================================================|>"
-                Write-Host "<|               "$cmp.ComponentName $cmp.Status
-                Write-Host "<|=======================================================================|>"
-                Write-Host $cmp.Log
-            }
+
+        $message = "Execution finished with status: " + $oldStatus
+        if ($goodStatuses -contains $oldStatus) {
             Write-VstsSetResult -Result "Succeeded" -Message $message
         }
+        else {
+            Write-VstsSetResult -Result "Failed" -Message $message
+        }
+    }
+    else {
+        Write-VstsSetResult -Result "Failed" -Message "DOrc did not return a valid request ID."
     }
 } finally {
     Trace-VstsLeavingInvocation $MyInvocation
