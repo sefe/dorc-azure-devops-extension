@@ -109,6 +109,27 @@ function Get-ApiErrorMessage {
         return $null
     }
 
+    function Normalize-ApiErrorMessage {
+        param([string]$Message)
+
+        if (-not $Message) {
+            return $Message
+        }
+
+        # Convert escaped apostrophe unicode to a visible quote style expected in pipeline logs.
+        $normalized = $Message -replace '\\u0027', '"'
+
+        # Decode remaining escaped unicode/control sequences when present.
+        try {
+            $normalized = [System.Text.RegularExpressions.Regex]::Unescape($normalized)
+        }
+        catch {
+            # Keep original normalized value if unescape fails.
+        }
+
+        return $normalized
+    }
+
     function Get-DorcAccessToken {
         param(
             [string]$TokenUrl,
@@ -267,6 +288,7 @@ function Get-ApiErrorMessage {
                 }
 
                 if ($apiError) {
+                    $apiError = Normalize-ApiErrorMessage -Message $apiError
                     throw "API Error: $apiError"
                 }
                 throw
@@ -297,6 +319,7 @@ function Get-ApiErrorMessage {
             }
 
             if ($apiError) {
+                $apiError = Normalize-ApiErrorMessage -Message $apiError
                 throw "API Error: $apiError"
             }
             throw
