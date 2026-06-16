@@ -119,15 +119,45 @@ function Get-ApiErrorMessage {
         # Convert escaped apostrophe unicode to a visible quote style expected in pipeline logs.
         $normalized = $Message -replace '\\u0027', '"'
 
-        # Decode remaining escaped unicode/control sequences when present.
-        try {
-            $normalized = [System.Text.RegularExpressions.Regex]::Unescape($normalized)
-        }
-        catch {
-            # Keep original normalized value if unescape fails.
-        }
+        # Preserve multiline output by converting escaped line breaks to actual line breaks.
+        $normalized = $normalized -replace '\\r\\n', "`r`n"
+        $normalized = $normalized -replace '\\n', "`n"
+        $normalized = $normalized -replace '\\r', "`r"
 
         return $normalized
+    }
+
+    function Convert-DorcLogForDisplay {
+        param([string]$LogText)
+
+        if (-not $LogText) {
+            return $LogText
+        }
+
+        $displayText = $LogText
+
+        # If API returned a JSON string (quoted with escaped newlines), deserialize first.
+        try {
+            $parsed = ConvertFrom-Json -InputObject $displayText -ErrorAction Stop
+            if ($parsed -is [string]) {
+                $displayText = $parsed
+            }
+        }
+        catch {
+            # Keep original text if it is not JSON.
+        }
+
+        # Fallback: unescape common escaped sequences so logs keep line breaks in output.
+        if ($displayText -match '\\r\\n|\\n|\\t') {
+            try {
+                $displayText = [System.Text.RegularExpressions.Regex]::Unescape($displayText)
+            }
+            catch {
+                # Keep as-is if unescape fails.
+            }
+        }
+
+        return $displayText
     }
 
     function Get-DorcAccessToken {
@@ -507,6 +537,7 @@ function Get-ApiErrorMessage {
             }
 
             if ($fullLog) {
+                $fullLog = Convert-DorcLogForDisplay -LogText $fullLog
                 Write-Host $fullLog
             }
         }
