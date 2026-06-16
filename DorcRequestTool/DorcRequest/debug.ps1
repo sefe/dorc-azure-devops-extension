@@ -1,5 +1,6 @@
 Import-Module -name .\ps_modules\VstsTaskSdk\vstsTaskSdk 
 $env:INPUT_BASEURL="http://localhost:32194/api"
+$env:INPUT_DORCIDSSECRET= ""
 $env:INPUT_PROJECT="SDCT"
 $env:INPUT_TARGETENV="Comms DV 01"
 $env:INPUT_BUILDTEXT="CommsTool.master_19.06.29.1"

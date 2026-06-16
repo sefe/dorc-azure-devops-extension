@@ -33,6 +33,133 @@ try {
         return $null
     }
 
+function Get-ApiErrorMessage {
+        param($Exception)
+
+        # Try ErrorDetails first (PowerShell 6+)
+        if ($Exception.ErrorDetails) {
+            if ($Exception.ErrorDetails.Message) {
+                try {
+                    $parsed = ConvertFrom-Json -InputObject $Exception.ErrorDetails.Message -ErrorAction SilentlyContinue
+                    if ($parsed.Message) {
+                        return $parsed.Message
+                    }
+                    if ($parsed.message) {
+                        return $parsed.message
+                    }
+                    if ($parsed.error_description) {
+                        return $parsed.error_description
+                    }
+                    if ($parsed -is [string]) {
+                        return $parsed
+                    }
+                    return ($parsed | ConvertTo-Json)
+                }
+                catch {
+                    return $Exception.ErrorDetails.Message
+                }
+            }
+        }
+
+        # Try to access response body from WebException (PowerShell < 6)
+        if ($Exception.Exception -is [System.Net.WebException]) {
+            try {
+                $webEx = $Exception.Exception
+                if ($webEx.Response -and $webEx.Response.GetType().Name -eq "HttpWebResponse") {
+                    $stream = $webEx.Response.GetResponseStream()
+                    if ($stream) {
+                        $reader = [System.IO.StreamReader]::new($stream)
+                        $responseBody = $reader.ReadToEnd()
+                        $reader.Dispose()
+                        if ($responseBody) {
+                            try {
+                                $parsed = ConvertFrom-Json -InputObject $responseBody -ErrorAction SilentlyContinue
+                                if ($parsed.Message) {
+                                    return $parsed.Message
+                                }
+                                if ($parsed.message) {
+                                    return $parsed.message
+                                }
+                                if ($parsed.error_description) {
+                                    return $parsed.error_description
+                                }
+                                return ($parsed | ConvertTo-Json)
+                            }
+                            catch {
+                                return $responseBody
+                            }
+                        }
+                    }
+                }
+            }
+            catch {
+                # Silently continue if response extraction fails
+            }
+        }
+
+        # Fallback to exception message
+        if ($Exception.Exception.Message) {
+            return $Exception.Exception.Message
+        }
+
+        if ($Exception.Message) {
+            return $Exception.Message
+        }
+
+        return $null
+    }
+
+    function Normalize-ApiErrorMessage {
+        param([string]$Message)
+
+        if (-not $Message) {
+            return $Message
+        }
+
+        # Convert escaped apostrophe unicode to a visible quote style expected in pipeline logs.
+        $normalized = $Message -replace '\\u0027', '"'
+
+        # Preserve multiline output by converting escaped line breaks to actual line breaks.
+        $normalized = $normalized -replace '\\r\\n', "`r`n"
+        $normalized = $normalized -replace '\\n', "`n"
+        $normalized = $normalized -replace '\\r', "`r"
+
+        return $normalized
+    }
+
+    function Convert-DorcLogForDisplay {
+        param([string]$LogText)
+
+        if (-not $LogText) {
+            return $LogText
+        }
+
+        $displayText = $LogText
+
+        # If API returned a JSON string (quoted with escaped newlines), deserialize first.
+        try {
+            $parsed = ConvertFrom-Json -InputObject $displayText -ErrorAction Stop
+            if ($parsed -is [string]) {
+                $displayText = $parsed
+            }
+        }
+        catch {
+            # Keep original text if it is not JSON.
+        }
+
+        # Fallback: unescape common escaped sequences so logs keep line breaks in output.
+        if ($displayText -match '\\r\\n|\\n|\\t') {
+            try {
+                $displayText = [System.Text.RegularExpressions.Regex]::Unescape($displayText)
+            }
+            catch {
+                # Keep as-is if unescape fails.
+            }
+        }
+
+        return $displayText
+    }
+
     function Get-DorcAccessToken {
         param(
             [string]$TokenUrl,
@@ -167,10 +294,64 @@ try {
                 $result = Invoke-RestMethod -Method POST -Uri $requestUrl -Body $jsonRequest -ContentType "application/json" -Headers $DorcAPIHeaders
             }
             catch {
+                $apiError = Get-ApiErrorMessage -Exception $_
+
+                # If still generic, attempt to read full response body from exception.
+                if (-not $apiError -or $apiError -like "*Bad Request*") {
+                    try {
+                        if ($_.ErrorDetails.Message) {
+                            $apiError = $_.ErrorDetails.Message
+                        }
+                        elseif ($_.Exception.Response) {
+                            $stream = $_.Exception.Response.GetResponseStream()
+                            $reader = [System.IO.StreamReader]::new($stream)
+                            $responseBody = $reader.ReadToEnd()
+                            $reader.Dispose()
+                            if ($responseBody) {
+                                $apiError = $responseBody
+                            }
+                        }
+                    }
+                    catch {
+                        # Keep original extracted error.
+                    }
+                }
+
+                if ($apiError) {
+                    $apiError = Normalize-ApiErrorMessage -Message $apiError
+                    throw "API Error: $apiError"
+                }
                 throw
             }
         }
         else {
+            $apiError = Get-ApiErrorMessage -Exception $_
+
+            # If still generic, attempt to read full response body from exception.
+            if (-not $apiError -or $apiError -like "*Bad Request*") {
+                try {
+                    if ($_.ErrorDetails.Message) {
+                        $apiError = $_.ErrorDetails.Message
+                    }
+                    elseif ($_.Exception.Response) {
+                        $stream = $_.Exception.Response.GetResponseStream()
+                        $reader = [System.IO.StreamReader]::new($stream)
+                        $responseBody = $reader.ReadToEnd()
+                        $reader.Dispose()
+                        if ($responseBody) {
+                            $apiError = $responseBody
+                        }
+                    }
+                }
+                catch {
+                    # Keep original extracted error.
+                }
+            }
+
+            if ($apiError) {
+                $apiError = Normalize-ApiErrorMessage -Message $apiError
+                throw "API Error: $apiError"
+            }
             throw
         }
     }
@@ -356,6 +537,7 @@ try {
             }
 
             if ($fullLog) {
+                $fullLog = Convert-DorcLogForDisplay -LogText $fullLog
                 Write-Host $fullLog
             }
         }
