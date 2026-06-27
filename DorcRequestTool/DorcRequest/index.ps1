@@ -214,6 +214,65 @@ function Get-ApiErrorMessage {
         }
     }
 
+    # Fetch a single component's log, transparently refreshing the token on a 401.
+    # Returns the log content as a string, or throws for non-401 failures (e.g. 404 when no log exists yet).
+    function Get-DorcComponentLog {
+        param(
+            [string]$LogUri,
+            [hashtable]$TokenState,
+            [string]$TokenUrl,
+            [hashtable]$IDSHeaders,
+            [hashtable]$IDSFormData,
+            [hashtable]$DorcAPIHeaders
+        )
+
+        try {
+            Ensure-DorcAccessToken -TokenState $TokenState -TokenUrl $TokenUrl -Headers $IDSHeaders -FormData $IDSFormData
+            $DorcAPIHeaders["Authorization"] = "Bearer $($TokenState.AccessToken)"
+            return (Invoke-WebRequest -Uri $LogUri -Method GET -Headers $DorcAPIHeaders -UseBasicParsing).Content
+        }
+        catch {
+            if ((Get-StatusCodeFromException -Exception $_) -eq 401) {
+                $newToken = Refresh-DorcAccessToken -TokenUrl $TokenUrl -Headers $IDSHeaders -FormData $IDSFormData
+                $TokenState.AccessToken = $newToken.AccessToken
+                $TokenState.ExpiresAt = $newToken.ExpiresAt
+                $DorcAPIHeaders["Authorization"] = "Bearer $($TokenState.AccessToken)"
+                return (Invoke-WebRequest -Uri $LogUri -Method GET -Headers $DorcAPIHeaders -UseBasicParsing).Content
+            }
+            throw
+        }
+    }
+
+    # Print only the portion of a component's log that hasn't been printed yet, tailing it live.
+    # $LengthState tracks chars already emitted per component; $HeaderState tracks whether the banner was shown.
+    function Write-ComponentLogDelta {
+        param(
+            [string]$Name,
+            [string]$LogContent,
+            [hashtable]$LengthState,
+            [hashtable]$HeaderState
+        )
+
+        if ($null -eq $LogContent) { return }
+
+        $printed = 0
+        if ($LengthState.ContainsKey($Name)) { $printed = $LengthState[$Name] }
+
+        # If the log was rewritten shorter than what we've seen, reprint from the start.
+        if ($LogContent.Length -lt $printed) { $printed = 0 }
+        if ($LogContent.Length -le $printed) { return }
+
+        if (-not $HeaderState.ContainsKey($Name)) {
+            Write-Host "<|=======================================================================|>"
+            Write-Host ("<|  {0}  |>" -f $Name)
+            Write-Host "<|=======================================================================|>"
+            $HeaderState[$Name] = $true
+        }
+        # Offsets are tracked against the raw log; convert only the new chunk for display.
+        Write-Host (Convert-DorcLogForDisplay -LogText $LogContent.Substring($printed))
+        $LengthState[$Name] = $LogContent.Length
+    }
+
     Import-VstsLocStrings "$PSScriptRoot\Task.json"
 
     # Get task variables.
@@ -230,6 +289,8 @@ function Get-ApiErrorMessage {
     [bool]$pinned = Get-VstsInput -Name pinned -AsBool -Default $false
     [string]$builduri = Get-VstsInput -Name builduri -Default $null
     [string]$vstfsUrl = Get-VstsInput -Name vstfsUrl -Default $null
+    [int]$pollIntervalSeconds = Get-VstsInput -Name pollIntervalSeconds -AsInt -Default 2
+    if ($pollIntervalSeconds -lt 1) { $pollIntervalSeconds = 1 }
 
     #receiving the token from IDS for DORC
     $baseurl = $baseurl.TrimEnd('/')
@@ -362,10 +423,14 @@ function Get-ApiErrorMessage {
         $oldStatus = ""
         $r = $null
         $componentStatuses = @{}
+        $componentLogLengths = @{}   # chars of each component's log already printed
+        $componentHeaderPrinted = @{} # whether the log banner was emitted for a component
+        $componentFinalized = @{}     # components whose final log has been fully streamed
+        $pendingStatuses = @("Pending", "NotStarted", "Not Started", "Queued", "")
         $pollStartTime = Get-Date
         $pollDeadline = $pollStartTime.AddMinutes(240)
         while ((-not ($validStatuses -contains $oldStatus)) -and ((Get-Date) -lt $pollDeadline)){
-            Start-Sleep -Seconds 5
+            Start-Sleep -Seconds $pollIntervalSeconds
 
             Ensure-DorcAccessToken -TokenState $tokenState -TokenUrl $IDSBaseURL -Headers $IDSHeaders -FormData $IDSFormData
             $DorcAPIHeaders["Authorization"] = "Bearer $($tokenState.AccessToken)"
@@ -427,15 +492,46 @@ function Get-ApiErrorMessage {
                     $currentComponents = @()
                 }
             }
-            foreach ($cmp in $currentComponents) {
+            # Flatten in case the response is wrapped in a nested array, so each
+            # $cmp is a single component object rather than the whole collection.
+            $flatComponents = @()
+            foreach ($entry in $currentComponents) {
+                $flatComponents += $entry
+            }
+
+            foreach ($cmp in $flatComponents) {
                 if (-not $cmp -or -not $cmp.ComponentName) { continue }
+                $name = [string]$cmp.ComponentName
+                $status = [string]$cmp.Status
+
+                # Announce status transitions.
                 $prevStatus = $null
-                if ($componentStatuses.ContainsKey($cmp.ComponentName)) {
-                    $prevStatus = $componentStatuses[$cmp.ComponentName]
+                if ($componentStatuses.ContainsKey($name)) {
+                    $prevStatus = $componentStatuses[$name]
                 }
-                if ($prevStatus -ne $cmp.Status) {
-                    Write-Host "  Component '$($cmp.ComponentName)': $($cmp.Status)"
-                    $componentStatuses[$cmp.ComponentName] = $cmp.Status
+                if ($prevStatus -ne $status) {
+                    Write-Host ("  [{0}] {1}" -f $status, $name)
+                    $componentStatuses[$name] = $status
+                }
+
+                # Stream the log live while the component is running, and capture the tail once it finishes.
+                if ($null -ne $cmp.Id -and -not $componentFinalized.ContainsKey($name)) {
+                    $isPending = $pendingStatuses -contains $status
+                    if (-not $isPending) {
+                        $isFinished = $status -ne "Running"
+                        $logUri = $baseurl + "/ResultStatuses/Log?requestId=$($result.Id)&resultId=$($cmp.Id)"
+                        try {
+                            $logContent = Get-DorcComponentLog -LogUri $logUri -TokenState $tokenState -TokenUrl $IDSBaseURL -IDSHeaders $IDSHeaders -IDSFormData $IDSFormData -DorcAPIHeaders $DorcAPIHeaders
+                            Write-ComponentLogDelta -Name $name -LogContent $logContent -LengthState $componentLogLengths -HeaderState $componentHeaderPrinted
+                        }
+                        catch {
+                            # 404 simply means no log is available yet; ignore and retry next poll.
+                            if ((Get-StatusCodeFromException -Exception $_) -ne 404) {
+                                Write-Host "Warning: Failed to fetch log for '$name': $($_.Exception.Message)"
+                            }
+                        }
+                        if ($isFinished) { $componentFinalized[$name] = $true }
+                    }
                 }
             }
         }
@@ -484,61 +580,31 @@ function Get-ApiErrorMessage {
             $cmps = @()
         }
 
+        # Safety net: emit logs for any component that finished too quickly to be tailed live.
+        # Components already streamed are skipped; for the rest only the un-printed tail is shown.
         foreach ($cmp in $cmps) {
             if (-not $cmp -or -not $cmp.ComponentName) { continue }
-            $fullLog = $null
-            Write-Host "<|=======================================================================|>"
-            Write-Host ("<|  {0}  {1}  |>" -f $cmp.ComponentName, $cmp.Status)
-            Write-Host "<|=======================================================================|>"
+            $name = [string]$cmp.ComponentName
+            if ($componentFinalized.ContainsKey($name)) { continue }
 
-            # Fetch full log for this component
             if ($null -ne $cmp.Id) {
                 $logUri = $baseurl + "/ResultStatuses/Log?requestId=$id&resultId=$($cmp.Id)"
                 try {
-                    try {
-                        Ensure-DorcAccessToken -TokenState $tokenState -TokenUrl $IDSBaseURL -Headers $IDSHeaders -FormData $IDSFormData
-                        $DorcAPIHeaders["Authorization"] = "Bearer $($tokenState.AccessToken)"
-                    }
-                    catch {
-                        Write-Host "Warning: Token refresh failed before fetching log for '$($cmp.ComponentName)': $($_.Exception.Message)"
-                    }
-
-                    $logResponse = Invoke-WebRequest -Uri $logUri -Method GET -Headers $DorcAPIHeaders -UseBasicParsing
-                    $fullLog = $logResponse.Content
+                    $logContent = Get-DorcComponentLog -LogUri $logUri -TokenState $tokenState -TokenUrl $IDSBaseURL -IDSHeaders $IDSHeaders -IDSFormData $IDSFormData -DorcAPIHeaders $DorcAPIHeaders
+                    Write-ComponentLogDelta -Name $name -LogContent $logContent -LengthState $componentLogLengths -HeaderState $componentHeaderPrinted
                 }
                 catch {
-                    $statusCode = Get-StatusCodeFromException -Exception $_
-                    if ($statusCode -eq 401) {
-                        try {
-                            $newToken = Refresh-DorcAccessToken -TokenUrl $IDSBaseURL -Headers $IDSHeaders -FormData $IDSFormData
-                            $tokenState.AccessToken = $newToken.AccessToken
-                            $tokenState.ExpiresAt = $newToken.ExpiresAt
-                            $DorcAPIHeaders["Authorization"] = "Bearer $($tokenState.AccessToken)"
-                            $logResponse = Invoke-WebRequest -Uri $logUri -Method GET -Headers $DorcAPIHeaders -UseBasicParsing
-                            $fullLog = $logResponse.Content
-                        }
-                        catch {
-                            Write-Host "Warning: Failed to fetch full log for component '$($cmp.ComponentName)' after token refresh: $($_.Exception.Message)"
-                            $fullLog = $cmp.Log
-                        }
-                    }
-                    elseif ($statusCode -eq 404) {
-                        Write-Host "No full log available for component '$($cmp.ComponentName)'. Showing preview:"
-                        $fullLog = $cmp.Log
+                    if ((Get-StatusCodeFromException -Exception $_) -eq 404) {
+                        Write-ComponentLogDelta -Name $name -LogContent $cmp.Log -LengthState $componentLogLengths -HeaderState $componentHeaderPrinted
                     }
                     else {
-                        Write-Host "Warning: Failed to fetch full log for component '$($cmp.ComponentName)': $($_.Exception.Message)"
-                        $fullLog = $cmp.Log
+                        Write-Host "Warning: Failed to fetch full log for component '$name': $($_.Exception.Message)"
+                        Write-ComponentLogDelta -Name $name -LogContent $cmp.Log -LengthState $componentLogLengths -HeaderState $componentHeaderPrinted
                     }
                 }
             }
             else {
-                $fullLog = $cmp.Log
-            }
-
-            if ($fullLog) {
-                $fullLog = Convert-DorcLogForDisplay -LogText $fullLog
-                Write-Host $fullLog
+                Write-ComponentLogDelta -Name $name -LogContent $cmp.Log -LengthState $componentLogLengths -HeaderState $componentHeaderPrinted
             }
         }
 

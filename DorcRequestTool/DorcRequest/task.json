@@ -8,7 +8,7 @@
     "author": "Ben Hegarty",
     "version": {
         "Major": 3,
-        "Minor": 4,
+        "Minor": 5,
         "Patch": 0
     },
     "instanceNameFormat": "Echo $(samplestring)",
@@ -78,8 +78,15 @@
             "type":"string",
             "label":"vstfs:// Build Uri",
             "helpMarkDown":"Point request to the build directly. Will ignore buildtext and buildnum if specified"
+        },
+        {
+            "name":"pollIntervalSeconds",
+            "type":"string",
+            "label":"Poll interval (seconds)",
+            "defaultValue":"2",
+            "helpMarkDown":"How often to poll DOrc for status and stream component logs. Lower = more real-time logs but more API calls. Default 2."
         }
-        
+
     ],
     "execution": {
         "PowerShell3": {
