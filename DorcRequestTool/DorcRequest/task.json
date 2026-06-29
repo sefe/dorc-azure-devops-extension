@@ -9,7 +9,7 @@
     "version": {
         "Major": 3,
         "Minor": 5,
-        "Patch": 0
+       "Patch": 2
     },
     "instanceNameFormat": "Echo $(samplestring)",
     "inputs": [
